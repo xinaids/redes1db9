@@ -7,7 +7,7 @@ import sys
 
 # --- 1. Configurações Globais ---
 BLOCK_SIZE = 100 
-CRC_SIZE = 4     
+CRC_SIZE = 4     # 4 bytes para CRC e também para o Tamanho Real (UINT32)
 START_SIGNAL = b'START:'
 END_SIGNAL = b'END\n'
 
@@ -16,30 +16,26 @@ POLYNOMIAL = 0xEDB88320
 CRC_TABLE = []
 
 def generate_crc_table():
-    """Gera a tabela CRC se ainda não foi gerada."""
     if CRC_TABLE:
         return
     for i in range(256):
         crc = i
         for _ in range(8):
-            # Lógica para cálculo do CRC-32/IEEE 802.3
             crc = (crc >> 1) ^ POLYNOMIAL if (crc & 1) else (crc >> 1)
         CRC_TABLE.append(crc)
 
 def calculate_crc32(data: bytes) -> int:
-    """Calcula o CRC32 de um bloco de bytes."""
     if not CRC_TABLE:
         generate_crc_table()
     crc = 0xFFFFFFFF
     for byte in data:
         crc = (crc >> 8) ^ CRC_TABLE[(crc ^ byte) & 0xFF]
-    # Inverte os bits para a finalização padrão do CRC32
     return crc ^ 0xFFFFFFFF
 
 # --- 3. Funções de Comunicação ---
 
 def emissor(file_path: str, port_name: str, baud_rate: int):
-    """Função do Emissor: Abre o arquivo, calcula CRC e envia pela serial."""
+    """Função do Emissor: Envia o arquivo pela serial, usando padding e metadados de tamanho."""
     print(f"📡 EMISSOR | Porta: {port_name} | Baud: {baud_rate}")
     
     if not os.path.exists(file_path):
@@ -49,7 +45,6 @@ def emissor(file_path: str, port_name: str, baud_rate: int):
     file_size = os.path.getsize(file_path)
     
     try:
-        # Abre a porta serial
         ser = serial.Serial(port_name, baud_rate, timeout=1)
         time.sleep(1) 
 
@@ -59,10 +54,8 @@ def emissor(file_path: str, port_name: str, baud_rate: int):
             ser.write(START_SIGNAL + file_name_bytes + b'\n')
             print(f"-> Iniciando transferência de: '{file_name_bytes.decode()}' ({file_size} bytes)")
             
-            # --- CORREÇÃO APLICADA AQUI ---
-            # Dá tempo para o receptor ler e processar o cabeçalho START:
+            # Atraso crucial para socat/WSL: Permite que o Receptor processe o cabeçalho START
             time.sleep(0.5) 
-            # ------------------------------
             
             bytes_sent = 0
             while True:
@@ -70,15 +63,26 @@ def emissor(file_path: str, port_name: str, baud_rate: int):
                 if not data_block:
                     break
 
-                # 2. Camada de Enlace: Calcula e empacota o CRC32
+                real_size = len(data_block)
+                
+                # --- NOVIDADE: PADDING DO BLOCO ---
+                # Garante que o bloco enviado tenha SEMPRE 100 bytes para sincronia
+                if real_size < BLOCK_SIZE:
+                    padding_needed = BLOCK_SIZE - real_size
+                    data_block += b'\x00' * padding_needed
+                
+                # 2. Camada de Enlace: Calcula CRC32 no bloco preenchido
                 checksum = calculate_crc32(data_block)
                 checksum_bytes = struct.pack('<I', checksum)
                 
-                # 3. Pacote: [CRC] + [Dados] -> Envio (Camada Física)
-                packet = checksum_bytes + data_block
+                # NOVIDADE: Empacota o Tamanho Real do bloco (4 bytes)
+                size_bytes = struct.pack('<I', real_size)
+                
+                # 3. Pacote: [CRC] + [Tamanho Real] + [Dados (100 bytes preenchidos)]
+                packet = checksum_bytes + size_bytes + data_block
                 ser.write(packet)
-                bytes_sent += len(data_block)
-
+                bytes_sent += real_size # Contamos APENAS os bytes reais
+                
                 # Progresso no CMD
                 sys.stdout.write(f"\r   Enviando... {bytes_sent / 1024:.2f} KB / {file_size / 1024:.2f} KB")
                 sys.stdout.flush()
@@ -98,7 +102,7 @@ def emissor(file_path: str, port_name: str, baud_rate: int):
             ser.close()
 
 def receptor(port_name: str, baud_rate: int):
-    """Função do Receptor: Lê serial, verifica CRC e salva o arquivo."""
+    """Função do Receptor: Lê serial, verifica CRC, descarta padding e salva o arquivo."""
     print(f"👂 RECEPTOR | Porta: {port_name} | Baud: {baud_rate}")
     
     ser = None
@@ -112,7 +116,6 @@ def receptor(port_name: str, baud_rate: int):
         file_name = None
         output_file = None
         while file_name is None:
-            # Tenta ler até a quebra de linha (enviada após START:)
             line = ser.readline()
             if line.startswith(START_SIGNAL):
                 file_name = line[len(START_SIGNAL):].strip().decode('utf-8')
@@ -125,37 +128,44 @@ def receptor(port_name: str, baud_rate: int):
         bytes_received = 0
         error_count = 0
         
-        # 2. Loop principal de recepção de blocos
+        # 2. Loop principal de recepção de blocos (108 bytes fixos)
         while True:
-            # Camada Física: Leitura do CRC
-            checksum_bytes = ser.read(CRC_SIZE)
+            # 2a. Leitura do CRC (4 bytes)
+            checksum_bytes = ser.read(CRC_SIZE) 
             
-            # Verifica o sinalizador de FIM
             if checksum_bytes.startswith(b'E') and b'END' in checksum_bytes: 
                 print("\n✅ Recebido sinalizador de FIM.")
                 break
             
+            # Se não leu 4 bytes, é erro de sincronia ou o buffer esvaziou
             if len(checksum_bytes) != CRC_SIZE:
-                print("\n   ERRO GRAVE: Falha na leitura do CRC ou desalinhamento.")
+                print("\n   ERRO GRAVE: Falha na leitura do CRC (Esperado 4 bytes).")
                 break
-                
-            # Camada Física: Leitura do bloco de dados
-            data_block = ser.read(BLOCK_SIZE)
+            
+            # 2b. Leitura do Tamanho Real (4 bytes)
+            size_bytes = ser.read(CRC_SIZE) 
+            if len(size_bytes) != CRC_SIZE:
+                 print("\n   ERRO GRAVE: Falha na leitura do Tamanho Real (Esperado 4 bytes).")
+                 break
+
+            real_size = struct.unpack('<I', size_bytes)[0]
+            
+            # 2c. Leitura do Bloco de Dados (100 bytes fixos)
+            data_block = ser.read(BLOCK_SIZE) 
             
             if len(data_block) != BLOCK_SIZE:
-                 # Erro de sincronização, o pacote não está completo
-                 print(f"\n   ERRO DE SINCRONIZAÇÃO: Leu {len(data_block)} de {BLOCK_SIZE} bytes.")
+                 print(f"\n   ERRO DE SINCRONIZAÇÃO: Leu {len(data_block)} de {BLOCK_SIZE} bytes de dados. Desalinhamento total.")
                  error_count += 1
-                 continue
+                 break # Erro irrecuperável
 
             # 3. Camada de Enlace: Verificação de Erros
             received_checksum = struct.unpack('<I', checksum_bytes)[0]
-            calculated_checksum = calculate_crc32(data_block)
+            calculated_checksum = calculate_crc32(data_block) # CRC calculado no bloco *preenchido*
 
             if received_checksum == calculated_checksum:
-                # 4. Camada de Aplicação: Salva os dados
-                output_file_handler.write(data_block)
-                bytes_received += len(data_block)
+                # 4. Camada de Aplicação: Salva APENAS o número de bytes reais
+                output_file_handler.write(data_block[:real_size])
+                bytes_received += real_size
                 
                 # Progresso no CMD
                 sys.stdout.write(f"\r   Recebendo... Total: {bytes_received / 1024:.2f} KB | Erros CRC: {error_count}")
@@ -163,7 +173,7 @@ def receptor(port_name: str, baud_rate: int):
 
             else:
                 error_count += 1
-                # Se o CRC falhar, o pacote é descartado e o contador de erros é incrementado.
+                # Ignora este pacote inválido
 
         print(f"\nRecepção finalizada. Total de bytes válidos: {bytes_received}. Erros de CRC detectados: {error_count}.")
 
@@ -195,8 +205,6 @@ def main():
                         help="Caminho do arquivo a ser enviado (obrigatório para o modo emissor).")
     
     args = parser.parse_args()
-
-    # Gera a tabela CRC uma vez
     generate_crc_table() 
     
     if args.modo == 'emissor':
