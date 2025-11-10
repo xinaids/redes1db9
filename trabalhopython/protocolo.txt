@@ -1,0 +1,6 @@
+Olá! Se você recebeu essa mensagem, o protocolo funcionou!
+Entao, quer dizer que um arquivo txt está mandando!
+Mas será que uma imagem ele manda?
+Só testando para saber!!!
+
+Mas se chegou ta legal... tem que saber se os acentos também estão funcionando!
