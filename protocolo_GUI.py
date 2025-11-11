@@ -1,350 +1,364 @@
 import serial
-import serial.tools.list_ports # NOVIDADE: Para listar portas
 import time
 import struct
-import threading
+import argparse
 import os
 import sys
+import signal
+import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 
-# --- 1. Configurações Globais ---
-DEFAULT_PORT = '/dev/ttyS0' # Padrão Linux
-DEFAULT_BAUD = 9600
+# --- Configurações Globais ---
 BLOCK_SIZE = 100
 CRC_SIZE = 4
-# --- Sinalizadores de Controle ---
-START_SIGNAL = b'START:'
-END_SIGNAL = b'END\n'
-ACK_SIGNAL = b'ACK\n'
-NACK_SIGNAL = b'NACK\n'
+SEQ_SIZE = 1
+MAX_PACKET_SIZE = SEQ_SIZE + CRC_SIZE + 4 + BLOCK_SIZE
+MAX_FILENAME_LEN = 256
 
-# --- 2. Camada de Enlace: Módulo CRC32 ---
+# --- Sinais de Controle ---
+START_TRANSMISSION_SIGNAL = b'START:'
+END_SIGNAL = b'END\n'
+ACK_STATUS_SIGNAL = b'ACK_STATUS:'
+ACK_CHAR = b'A'
+NAK_CHAR = b'N'
+
+# --- Parâmetros do Protocolo ---
+TIMEOUT_SEC = 3
+MAX_RETRANS = 5
+
+received_interrupt = False
 POLYNOMIAL = 0xEDB88320
 CRC_TABLE = []
 
+
 def generate_crc_table():
+    global CRC_TABLE
     if CRC_TABLE:
         return
     for i in range(256):
         crc = i
         for _ in range(8):
             crc = (crc >> 1) ^ POLYNOMIAL if (crc & 1) else (crc >> 1)
-        CRC_TABLE.append(crc)
+        CRC_TABLE.append(crc & 0xFFFFFFFF)
 
-def calculate_crc32(data: bytes) -> int:
-    if not CRC_TABLE:
-        generate_crc_table()
+
+def calculate_crc32(data: bytes) -> bytes:
     crc = 0xFFFFFFFF
     for byte in data:
         crc = (crc >> 8) ^ CRC_TABLE[(crc ^ byte) & 0xFF]
-    return crc ^ 0xFFFFFFFF
-
-# --- 3. Classe Principal da Interface Gráfica ---
-
-class ProtocoloGUI:
-    def __init__(self, master):
-        self.master = master
-        master.title("Protocolo Redes I - Serial (2, 3, 5)")
-        
-        self.serial_port = serial.Serial()
-        self.running = False
-        self.file_path = ""
-        self.mode = tk.StringVar(value="Emissor")
-        
-        # Gera a tabela CRC uma vez no início
-        generate_crc_table() 
-
-        self._create_widgets()
-
-    def _get_available_ports(self):
-        """Lista as portas seriais disponíveis no sistema."""
-        ports = serial.tools.list_ports.comports()
-        # Retorna uma lista de strings contendo apenas o nome da porta (ex: '/dev/ttyS0')
-        return [p.device for p in ports]
-
-    def _refresh_ports(self):
-        """Atualiza a lista de portas na Combobox."""
-        new_ports = self._get_available_ports()
-        self.port_entry['values'] = new_ports
-        
-        current_port = self.port_entry.get()
-        if new_ports and current_port not in new_ports:
-             # Tenta usar a porta padrão Linux, senão usa a primeira encontrada
-             if DEFAULT_PORT in new_ports:
-                 self.port_entry.set(DEFAULT_PORT)
-             else:
-                 self.port_entry.set(new_ports[0])
-        elif not current_port:
-             self.port_entry.set(DEFAULT_PORT)
-             
-        self.log("Lista de portas atualizada.")
+    return struct.pack('<I', crc ^ 0xFFFFFFFF)
 
 
-    def _create_widgets(self):
-        # Configurações Gerais
-        frame_config = ttk.LabelFrame(self.master, text="🛠️ Configurações Gerais")
-        frame_config.pack(padx=10, pady=10, fill="x")
+def get_checkpoint_filepath(filename: str) -> str:
+    return f"{filename}.temp"
 
-        ttk.Label(frame_config, text="Porta Serial:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        
-        # --- NOVIDADE: Combobox para Portas ---
-        self.port_list = self._get_available_ports()
-        self.port_entry = ttk.Combobox(frame_config, values=self.port_list, width=18)
-        
-        # Define o valor inicial
-        if self.port_list:
-            if DEFAULT_PORT in self.port_list:
-                self.port_entry.set(DEFAULT_PORT)
-            else:
-                 self.port_entry.set(self.port_list[0])
+
+def save_checkpoint(filename: str, last_block: int):
+    try:
+        with open(get_checkpoint_filepath(filename), 'w') as f:
+            f.write(str(last_block))
+    except Exception as e:
+        print(f"[ERRO] Falha ao salvar checkpoint: {e}", file=sys.stderr)
+
+
+def load_checkpoint(filename: str) -> int:
+    path = get_checkpoint_filepath(filename)
+    if not os.path.exists(path):
+        return 0
+    try:
+        with open(path, 'r') as f:
+            return int(f.read().strip())
+    except Exception:
+        return 0
+
+
+def remove_checkpoint(filename: str):
+    path = get_checkpoint_filepath(filename)
+    if os.path.exists(path):
+        os.remove(path)
+        print("[CHECKPOINT] Removido com sucesso.")
+
+
+def receive_with_timeout(ser: serial.Serial, max_len: int, timeout_sec: int) -> bytes:
+    original_timeout = ser.timeout
+    ser.timeout = timeout_sec
+    data = b''
+    start_time = time.time()
+
+    while time.time() - start_time < timeout_sec:
+        if received_interrupt:
+            ser.timeout = original_timeout
+            return b''
+        chunk = ser.read(max_len - len(data))
+        if chunk:
+            data += chunk
+            if len(data) >= max_len:
+                break
         else:
-            self.port_entry.set(DEFAULT_PORT)
-            
-        self.port_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-        
-        # Botão para atualizar a lista
-        self.refresh_button = ttk.Button(frame_config, text="⟳", width=3, command=self._refresh_ports)
-        self.refresh_button.grid(row=0, column=2, padx=5, pady=5, sticky="e")
-        
-        # --- FIM NOVIDADE ---
+            time.sleep(0.01)
+    ser.timeout = original_timeout
+    return data
 
-        ttk.Label(frame_config, text="Baud Rate:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
-        self.baud_entry = ttk.Entry(frame_config, width=20)
-        self.baud_entry.insert(0, str(DEFAULT_BAUD))
-        self.baud_entry.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
 
-        # Modo de Operação
-        frame_mode = ttk.LabelFrame(self.master, text="⚙️ Modo de Operação")
-        frame_mode.pack(padx=10, pady=10, fill="x")
+# --- Emissor ---
+def emissor_handler(ser, file_path, log):
+    global received_interrupt
+    try:
+        file_size = os.path.getsize(file_path)
+        total_blocks = (file_size + BLOCK_SIZE - 1) // BLOCK_SIZE
+        log(f"📡 EMISSOR | Tamanho: {file_size} bytes | Blocos Totais: {total_blocks}")
 
-        self.radio_emissor = ttk.Radiobutton(frame_mode, text="Emissor (Enviar)", variable=self.mode, value="Emissor", command=self._update_ui)
-        self.radio_emissor.grid(row=0, column=0, padx=10, pady=5, sticky="w")
-        
-        self.radio_receptor = ttk.Radiobutton(frame_mode, text="Receptor (Receber)", variable=self.mode, value="Receptor", command=self._update_ui)
-        self.radio_receptor.grid(row=0, column=1, padx=10, pady=5, sticky="w")
+        status_signal = START_TRANSMISSION_SIGNAL + file_path.encode('utf-8') + b'\n'
+        log(f"[PROTO] Enviando solicitação de STATUS/START para '{file_path}'...")
 
-        # Controles do Emissor
-        self.frame_emissor = ttk.LabelFrame(self.master, text="📤 Controle do Emissor")
-        self.frame_emissor.pack(padx=10, pady=10, fill="x")
-        
-        self.file_label = ttk.Label(self.frame_emissor, text="Nenhum arquivo selecionado.")
-        self.file_label.grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        
-        self.file_button = ttk.Button(self.frame_emissor, text="Selecionar Arquivo", command=self._select_file)
-        self.file_button.grid(row=0, column=1, padx=5, pady=5, sticky="e")
-        
-        # Botões de Ação
-        frame_action = ttk.Frame(self.master)
-        frame_action.pack(padx=10, pady=10, fill="x")
-        
-        self.start_button = ttk.Button(frame_action, text="INICIAR (Aguardar/Enviar)", command=self._start_stop)
-        self.start_button.pack(side="left", fill="x", expand=True, padx=5)
-        
-        # Log e Progresso
-        frame_log = ttk.LabelFrame(self.master, text="📊 Log e Progresso")
-        frame_log.pack(padx=10, pady=10, fill="both", expand=True)
-        
-        self.progress_bar = ttk.Progressbar(frame_log, orient="horizontal", length=300, mode="determinate")
-        self.progress_bar.pack(fill="x", padx=5, pady=5)
-        
-        self.log_text = tk.Text(frame_log, height=10, state='disabled')
-        self.log_text.pack(fill="both", expand=True, padx=5, pady=5)
-        
-        self._update_ui()
-        self.log("Sistema pronto. Verifique as configurações da porta serial.")
-        
-    def _update_ui(self):
-        if self.mode.get() == "Emissor":
-            self.frame_emissor.pack(padx=10, pady=10, fill="x")
-            self.start_button.config(text="INICIAR TRANSMISSÃO")
-        else:
-            self.frame_emissor.pack_forget()
-            self.start_button.config(text="INICIAR ESCUTA (RECEPTOR)")
+        current_block = 0
+        retries = 0
+        while retries < MAX_RETRANS:
+            if received_interrupt:
+                return
+            ser.write(status_signal)
+            response = receive_with_timeout(ser, MAX_FILENAME_LEN, TIMEOUT_SEC)
+            if response and response.startswith(ACK_STATUS_SIGNAL):
+                blk = int(response[len(ACK_STATUS_SIGNAL):].strip().decode('utf-8'))
+                current_block = blk
+                log(f"[PROTO] Recebido ACK de STATUS. Retomando do Bloco {current_block}.")
+                break
+            retries += 1
+            log(f"[TIMEOUT] Timeout ({retries}/{MAX_RETRANS}). Reenviando solicitação...")
 
-    def log(self, message):
-        self.log_text.config(state='normal')
-        self.log_text.insert('end', f"[{time.strftime('%H:%M:%S')}] {message}\n")
-        self.log_text.see('end')
-        self.log_text.config(state='disabled')
-        
-    def _select_file(self):
-        if self.running:
-             messagebox.showerror("Erro", "Pare a operação antes de selecionar um novo arquivo.")
-             return
-             
-        self.file_path = filedialog.askopenfilename()
-        if self.file_path:
-            self.file_label.config(text=f"Arquivo: {os.path.basename(self.file_path)} ({(os.path.getsize(self.file_path) / 1024):.2f} KB)")
-            
-    def _start_stop(self):
-        if self.running:
-            self._stop()
-        else:
-            self._start()
-
-    def _start(self):
-        if self.mode.get() == "Emissor" and not self.file_path:
-            messagebox.showerror("Erro", "Selecione um arquivo para enviar.")
+        if retries >= MAX_RETRANS:
+            log("[ERRO] Máximo de retentativas atingido. Abortando.")
             return
 
-        try:
-            port = self.port_entry.get()
-            baud = int(self.baud_entry.get())
-            
-            self.serial_port = serial.Serial(port, baud, timeout=3)
-            self.running = True
-            
-            self.port_entry.config(state='disabled')
-            self.baud_entry.config(state='disabled')
-            self.refresh_button.config(state='disabled')
-            self.start_button.config(text="PARAR OPERAÇÃO", style='Danger.TButton')
-            
-            if self.mode.get() == "Emissor":
-                thread = threading.Thread(target=self._run_emissor)
-            else:
-                thread = threading.Thread(target=self._run_receptor)
-            
-            thread.daemon = True
-            thread.start()
-            self.log(f"Comunicação iniciada em modo **{self.mode.get()}** na porta {port}.")
-            
-        except ValueError:
-            messagebox.showerror("Erro", "Taxa de transmissão inválida.")
-        except serial.SerialException as e:
-            messagebox.showerror("Erro Serial", f"Não foi possível abrir a porta {self.port_entry.get()}.\nVerifique as permissões (grupo 'dialout') e se a porta está correta.\nErro: {e}")
-            self.running = False
+        current_block_to_send = current_block
+        current_seq_num = current_block % 2
 
-    def _stop(self):
-        self.running = False
-        try:
-            if self.serial_port and self.serial_port.is_open:
-                self.serial_port.close()
-            self.log("Comunicação PARADA pelo usuário.")
-        except Exception as e:
-            self.log(f"Erro ao fechar a porta: {e}")
-        finally:
-            self.progress_bar['value'] = 0
-            self.port_entry.config(state='normal')
-            self.baud_entry.config(state='normal')
-            self.refresh_button.config(state='normal')
-            self.start_button.config(text="INICIAR (Aguardar/Enviar)", style='TButton')
-            
-    # --- Funções de Comunicação (Sem Alteração na Lógica de Protocolo) ---
+        with open(file_path, 'rb') as f_in:
+            f_in.seek(current_block * BLOCK_SIZE)
+            log("[PROTO] Transferência Stop-and-Wait iniciada.")
 
-    def _run_emissor(self):
-        file_path = self.file_path
-        file_size = os.path.getsize(file_path)
-        
-        try:
-            with open(file_path, 'rb') as f:
-                file_name_bytes = os.path.basename(file_path).encode('utf-8')
-                self.serial_port.write(START_SIGNAL + file_name_bytes + b'\n')
-                self.log(f"Enviando '{file_name_bytes.decode()}' ({file_size} bytes)...")
-                
-                bytes_sent = 0
-                while self.running:
-                    data_block = f.read(BLOCK_SIZE)
-                    if not data_block:
-                        break
-
-                    checksum = calculate_crc32(data_block)
-                    checksum_bytes = struct.pack('<I', checksum)
-                    packet = checksum_bytes + data_block
-                    
-                    self.serial_port.write(packet)
-                    bytes_sent += len(data_block)
-                    
-                    progress = (bytes_sent / file_size) * 100
-                    self.master.after(0, lambda: self.progress_bar.config(value=progress))
-                    
-                    time.sleep(0.005) 
-                    
-                self.serial_port.write(END_SIGNAL)
-                self.log(f"✅ Transmissão concluída. Total: {bytes_sent} bytes.")
-
-        except Exception as e:
-            self.log(f"❌ Erro durante a transmissão: {e}")
-        finally:
-            self._stop()
-
-    def _run_receptor(self):
-        output_file_handler = None
-        
-        try:
-            self.log("Aguardando cabeçalho de início (START:)...")
-            file_name = None
-            while self.running and file_name is None:
-                line = self.serial_port.readline()
-                if line.startswith(START_SIGNAL):
-                    file_name = line[len(START_SIGNAL):].strip().decode('utf-8')
-                    output_file = "recebido_" + file_name
-                    self.log(f"-> Recebido cabeçalho. Arquivo de destino: {output_file}")
-                    output_file_handler = open(output_file, 'wb')
-                elif line:
-                     self.log(f"Ignorando dado inesperado: {line.strip()}")
-                time.sleep(0.1)
-                
-            bytes_received = 0
-            error_count = 0
-            
-            while self.running:
-                checksum_bytes = self.serial_port.read(CRC_SIZE)
-                
-                if not checksum_bytes and self.serial_port.in_waiting == 0:
-                    time.sleep(0.1)
-                    continue
-                    
-                if checksum_bytes.startswith(b'E') and b'END' in checksum_bytes:
-                    self.log("✅ Recebido sinalizador de FIM.")
+            while current_block_to_send <= total_blocks - 1:
+                if received_interrupt:
+                    log("-- INTERRUPÇÃO RECEBIDA --")
                     break
-                
-                if len(checksum_bytes) != CRC_SIZE:
-                    if checksum_bytes.startswith(b'E'):
-                         self.serial_port.read_until(b'\n')
-                         self.log("✅ Recebido sinalizador de FIM (corrigido).")
-                         break
-                    self.log("ERRO GRAVE: Falha na leitura do CRC.")
+
+                data_buffer = f_in.read(BLOCK_SIZE)
+                if not data_buffer:
                     break
-                    
-                data_block = self.serial_port.read(BLOCK_SIZE)
-                
-                if len(data_block) != BLOCK_SIZE:
-                    self.log(f"ERRO DE SINCRONIZAÇÃO: Leu {len(data_block)} de {BLOCK_SIZE} bytes.")
-                    error_count += 1
+
+                data_len = len(data_buffer)
+                crc_bytes = calculate_crc32(data_buffer)
+                packet = bytes([current_seq_num]) + crc_bytes + struct.pack('<I', data_len) + data_buffer
+
+                retries = 0
+                ack_ok = False
+                while retries < MAX_RETRANS and not ack_ok:
+                    ser.write(packet)
+                    response = receive_with_timeout(ser, 1, TIMEOUT_SEC)
+                    if response == ACK_CHAR:
+                        log(f"[ACK] Bloco {current_block_to_send + 1} confirmado.")
+                        ack_ok = True
+                    elif response == NAK_CHAR:
+                        log(f"[NAK] Retransmitindo Bloco {current_block_to_send + 1}.")
+                        retries += 1
+                    else:
+                        retries += 1
+                        log(f"[TIMEOUT] Sem resposta, reenviando Bloco {current_block_to_send + 1}.")
+
+                if not ack_ok:
+                    log(f"[ERRO] Falha no Bloco {current_block_to_send + 1}. Abortando.")
+                    break
+
+                current_block_to_send += 1
+                current_seq_num = 1 - current_seq_num
+
+        if current_block_to_send >= total_blocks and not received_interrupt:
+            log("[PROTO] Transferência concluída. Enviando END.")
+            ser.write(END_SIGNAL)
+
+    except Exception as e:
+        log(f"[ERRO] {e}")
+    finally:
+        if ser.is_open:
+            ser.close()
+            log("Porta serial fechada.")
+
+
+# --- Receptor ---
+def receptor_handler(ser, log):
+    global received_interrupt
+    try:
+        log("👂 RECEPTOR | Aguardando solicitação de STATUS do arquivo (máx 30 seg)...")
+
+        ser.timeout = 30
+        status_signal_received = ser.readline()
+        if not status_signal_received:
+            log("[TIMEOUT] Timeout ao aguardar STATUS.")
+            return
+
+        ser.flushInput()
+        ser.flushOutput()
+
+        if not status_signal_received.startswith(START_TRANSMISSION_SIGNAL):
+            log(f"[ERRO] Sinal inválido: {status_signal_received}")
+            return
+
+        file_name = status_signal_received[len(START_TRANSMISSION_SIGNAL):].strip().decode('utf-8')
+        base_name = os.path.basename(file_name)
+        output_file_path = f"recebido_{base_name}"
+        log(f"[PROTO] Recebido sinal de STATUS do arquivo '{file_name}'. Será salvo como '{output_file_path}'.")
+
+        last_block_received = load_checkpoint(output_file_path)
+        mode = 'ab' if last_block_received > 0 else 'wb'
+        f_out = open(output_file_path, mode)
+
+        ack_status = ACK_STATUS_SIGNAL + str(last_block_received).encode('utf-8') + b'\n'
+        ser.write(ack_status)
+        log(f"[PROTO] Enviando ACK_STATUS (Retomar do Bloco {last_block_received}).")
+
+        expected_seq_num = last_block_received % 2
+        current_block = last_block_received
+
+        while True:
+            header = receive_with_timeout(ser, 1, 10)
+            if not header:
+                log("[AVISO] Timeout de leitura. Encerrando recepção.")
+                break
+
+            header_rest = receive_with_timeout(ser, 8, 1)
+            if len(header_rest) < 8:
+                ser.write(NAK_CHAR)
+                continue
+
+            seq = header[0]
+            recv_crc = header_rest[0:4]
+            data_len = struct.unpack('<I', header_rest[4:8])[0]
+
+            data = receive_with_timeout(ser, data_len, 2)
+            if len(data) != data_len:
+                ser.write(NAK_CHAR)
+                continue
+
+            calc_crc = calculate_crc32(data)
+            if calc_crc != recv_crc:
+                ser.write(NAK_CHAR)
+                continue
+
+            if seq != expected_seq_num:
+                if seq == (1 - expected_seq_num):
+                    ser.write(ACK_CHAR)
                     continue
-
-                received_checksum = struct.unpack('<I', checksum_bytes)[0]
-                calculated_checksum = calculate_crc32(data_block)
-
-                if received_checksum == calculated_checksum:
-                    output_file_handler.write(data_block)
-                    bytes_received += len(data_block)
-                    # Apenas loga o progresso a cada 1KB para não poluir o log
-                    if bytes_received % 1024 == 0:
-                        self.master.after(0, lambda: self.log(f"   Recebido {bytes_received} bytes (OK)."))
                 else:
-                    error_count += 1
-                    self.log(f"   ❌ ERRO DE DADOS detectado (CRC Inválido). Erros: {error_count}")
+                    ser.write(NAK_CHAR)
+                    continue
 
-            self.log(f"Recepção finalizada. Total de bytes recebidos: {bytes_received}. Erros de CRC: {error_count}.")
+            f_out.write(data)
+            f_out.flush()
+            ser.write(ACK_CHAR)
+            expected_seq_num = 1 - expected_seq_num
+            current_block += 1
+            save_checkpoint(output_file_path, current_block)
+            log(f"[RECEPTOR] Bloco {current_block} OK. Enviando ACK.")
+
+        f_out.close()
+        log("[PROTO] Transferência concluída.")
+        remove_checkpoint(output_file_path)
+
+    except Exception as e:
+        log(f"[ERRO] {e}")
+    finally:
+        if ser.is_open:
+            ser.close()
+            log("Porta serial fechada.")
+
+
+# --- Interface Tkinter ---
+class SerialApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Protocolo Serial Stop-and-Wait com Checkpointing")
+        self.geometry("720x500")
+
+        self.mode = tk.StringVar(value="emissor")
+        self.port = tk.StringVar()
+        self.baud = tk.IntVar(value=115200)
+        self.file_path = tk.StringVar()
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        frm = ttk.Frame(self)
+        frm.pack(padx=10, pady=10, fill="x")
+
+        ttk.Label(frm, text="Modo:").grid(column=0, row=0, sticky="w")
+        ttk.Radiobutton(frm, text="Emissor", variable=self.mode, value="emissor").grid(column=1, row=0)
+        ttk.Radiobutton(frm, text="Receptor", variable=self.mode, value="receptor").grid(column=2, row=0)
+
+        ttk.Label(frm, text="Porta:").grid(column=0, row=1, sticky="w")
+        ttk.Entry(frm, textvariable=self.port, width=15).grid(column=1, row=1)
+        ttk.Label(frm, text="Baud Rate:").grid(column=2, row=1, sticky="w")
+        ttk.Entry(frm, textvariable=self.baud, width=10).grid(column=3, row=1)
+
+        ttk.Label(frm, text="Arquivo:").grid(column=0, row=2, sticky="w")
+        ttk.Entry(frm, textvariable=self.file_path, width=50).grid(column=1, row=2, columnspan=2)
+        ttk.Button(frm, text="Selecionar...", command=self.choose_file).grid(column=3, row=2)
+
+        ttk.Button(frm, text="Iniciar", command=self.start_transfer).grid(column=1, row=3, pady=10)
+
+        self.text_log = scrolledtext.ScrolledText(self, wrap=tk.WORD, height=20)
+        self.text_log.pack(padx=10, pady=5, fill="both", expand=True)
+
+    def choose_file(self):
+        file = filedialog.askopenfilename()
+        if file:
+            self.file_path.set(file)
+
+    def log(self, msg):
+        self.text_log.insert(tk.END, msg + "\n")
+        self.text_log.see(tk.END)
+        self.update()
+
+    def start_transfer(self):
+        port = self.port.get()
+        baud = self.baud.get()
+        mode = self.mode.get()
+        file = self.file_path.get()
+
+        if not port:
+            messagebox.showerror("Erro", "Informe a porta serial (ex: /dev/pts/4)")
+            return
+
+        generate_crc_table()
+        try:
+            ser = serial.Serial(
+                port=port,
+                baudrate=baud,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=1,
+                rtscts=False,
+            )
+            self.log(f"✅ Porta {port} aberta @ {baud} baud")
+
+            t = threading.Thread(target=self.run_protocol, args=(ser, mode, file))
+            t.daemon = True
+            t.start()
 
         except Exception as e:
-            self.log(f"❌ Erro durante a recepção: {e}")
-        finally:
-            if output_file_handler:
-                output_file_handler.close()
-                # O nome do arquivo pode ter sido criado, mas não preenchido em caso de erro.
-                self.log("Arquivo de destino fechado.")
-            self._stop()
+            messagebox.showerror("Erro", str(e))
 
-# --- Execução Principal ---
-if __name__ == '__main__':
-    root = tk.Tk()
-    style = ttk.Style(root)
-    # Garante que o tema GTK (nativo do Linux Mint) seja usado
-    style.theme_use('clam') 
-    style.configure('Danger.TButton', foreground='red')
-    
-    app = ProtocoloGUI(root)
-    root.mainloop()
+    def run_protocol(self, ser, mode, file):
+        if mode == "emissor":
+            if not file:
+                self.log("[ERRO] Nenhum arquivo selecionado para envio.")
+                return
+            emissor_handler(ser, file, self.log)
+        else:
+            receptor_handler(ser, self.log)
+
+
+if __name__ == "__main__":
+    app = SerialApp()
+    app.mainloop()
