@@ -115,7 +115,7 @@ def emissor_handler(ser: serial.Serial, file_path: str):
     try:
         file_size = os.path.getsize(file_path)
         total_blocks = (file_size + BLOCK_SIZE - 1) // BLOCK_SIZE
-        print(f"📡 EMISSOR | Tamanho: {file_size} bytes | Blocos Totais: {total_blocks}")
+        print(f"EMISSOR | Tamanho: {file_size} bytes | Blocos Totais: {total_blocks}")
 
         # Handshake inicial
         status_signal = START_TRANSMISSION_SIGNAL + file_path.encode('utf-8') + b'\n'
@@ -201,7 +201,7 @@ def emissor_handler(ser: serial.Serial, file_path: str):
 def receptor_handler(ser: serial.Serial):
     global received_interrupt
     try:
-        print("👂 RECEPTOR | Aguardando solicitação de STATUS do arquivo (máx 30 seg)...")
+        print("RECEPTOR | Aguardando solicitação de STATUS do arquivo (máx 30 seg)...")
 
         ser.timeout = 30
         status_signal_received = ser.readline()
@@ -308,7 +308,7 @@ def main():
             timeout=1,
             rtscts=False,
         )
-        print(f"✅ Porta serial {args.port} aberta @ {args.baud} baud.")
+        print(f"Porta serial {args.port} aberta @ {args.baud} baud.")
         ser.flushInput()
         ser.flushOutput()
 
