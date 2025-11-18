@@ -125,25 +125,10 @@ Necessário ter `protocolo.py` e o arquivo `biro.png` em ambos os computadores (
 
 ---
 
-### 🖼️ Versão com Interface Gráfica (Opcional - Linux)
-
-Caso implementada em **Tkinter**, a GUI permite:
-
-- Seleção da porta serial  
-- Escolha do modo (Emissor/Receptor)  
-- Seleção do arquivo a enviar  
-- Visualização de log em tempo real  
-
 📦 **Instalação de dependências:**
 
 ```bash
 sudo apt install python3-tk python3-serial
-```
-
-▶️ **Execução da GUI:**
-
-```bash
-python3 protocolo_gui.py
 ```
 
 ---
