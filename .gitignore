@@ -1078,3 +1078,4 @@ venv/lib/python3.12/site-packages/serial/urlhandler/protocol_socket.py
 venv/lib/python3.12/site-packages/serial/urlhandler/protocol_spy.py
 venv/lib/python3.12/site-packages/serial/win32.py
 venv/pyvenv.cfg
+protocolo_GUI.py
